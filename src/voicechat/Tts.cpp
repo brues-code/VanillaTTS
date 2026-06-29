@@ -44,10 +44,12 @@
 #include "Game.h"
 #include "cvar/Factory.h"
 #include "event/Custom.h"
+#include "tick/WorldTick.h"
 #include "voicechat/Backend.h"
 #include "voicechat/SapiBackend.h"
+#include "voicechat/SynthAbi.h"
 
-#include <windows.h> // WideCharToMultiByte / MultiByteToWideChar
+#include <windows.h> // WideCharToMultiByte / MultiByteToWideChar, LoadLibrary
 
 #include <algorithm>
 #include <cstdint>
@@ -130,17 +132,55 @@ std::vector<VoiceEntry> g_cachedVoices;
 SapiBackend g_sapi;
 ITtsBackend *g_backend = nullptr;
 
-// Pick a backend honoring the ttsEngine cvar. "auto" prefers SAPI and falls
-// through to Flite when SAPI is unavailable/voiceless (the Wine case);
-// "sapi"/"flite" force a specific engine, with a fallback so TTS still works
-// if the forced engine can't initialize. Flite lives in a lazily-loaded
-// VanillaTTS_synth.dll (Step 6) — not wired up yet, so the Flite branch is a
-// placeholder for now.
-ITtsBackend *FliteBackend() {
-    // TODO(Step 6): LoadLibrary("VanillaTTS_synth.dll") and adopt its backend.
-    return nullptr;
+// Lazily load VanillaTTS_synth.dll (the espeak-ng software synth) from beside
+// this DLL and adopt its backend. Cached after the first attempt so a missing
+// synth DLL isn't retried on every selection. The synth backend reports
+// playback lifecycle through SynthHost → Playback::, the same path SAPI uses.
+ITtsBackend *LoadSynthBackend() {
+    static bool tried = false;
+    static ITtsBackend *cached = nullptr;
+    if (tried)
+        return cached;
+    tried = true;
+
+    // Resolve the synth DLL next to this (core) DLL: LoadLibrary's default
+    // search starts at the EXE dir, not our dll_local, so build an explicit
+    // path from our own module location.
+    char path[MAX_PATH] = {};
+    HMODULE self = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(&LoadSynthBackend), &self) &&
+        GetModuleFileNameA(self, path, MAX_PATH) > 0) {
+        char *slash = std::strrchr(path, '\\');
+        if (slash != nullptr)
+            slash[1] = '\0';
+    } else {
+        path[0] = '\0';
+    }
+    const std::string dll = std::string(path) + "VanillaTTS_synth.dll";
+
+    HMODULE mod = LoadLibraryA(dll.c_str());
+    if (mod == nullptr)
+        mod = LoadLibraryA("VanillaTTS_synth.dll"); // fall back to default search
+    if (mod == nullptr)
+        return nullptr;
+
+    auto create =
+        reinterpret_cast<CreateBackendFn>(GetProcAddress(mod, kCreateBackendExport));
+    if (create == nullptr)
+        return nullptr;
+
+    static const SynthHost host{&Playback::Started, &Playback::Finished,
+                                &Playback::Failed};
+    cached = create(&host);
+    return cached;
 }
 
+// Pick a backend honoring the ttsEngine cvar. "auto" prefers SAPI and falls
+// through to the software synth when SAPI is unavailable/voiceless (the Wine
+// case); "sapi"/"espeak" force a specific engine, with a fallback so TTS
+// still works if the forced engine can't initialize.
 ITtsBackend *SelectBackend() {
     const char *raw = CVar::Factory::GetString(g_cvarEngine);
     const std::string mode = (raw != nullptr && *raw != '\0') ? raw : "auto";
@@ -149,19 +189,19 @@ ITtsBackend *SelectBackend() {
         if (g_sapi.Init())
             return &g_sapi;
     }
-    if (mode == "flite" || mode == "auto") {
-        ITtsBackend *flite = FliteBackend();
-        if (flite != nullptr && flite->Init())
-            return flite;
+    if (mode == "espeak" || mode == "auto") {
+        ITtsBackend *synth = LoadSynthBackend();
+        if (synth != nullptr && synth->Init())
+            return synth;
     }
     // Forced engine couldn't initialize — fall back so TTS still functions.
-    if (mode == "flite") {
+    if (mode == "espeak") {
         if (g_sapi.Init())
             return &g_sapi;
     } else if (mode == "sapi") {
-        ITtsBackend *flite = FliteBackend();
-        if (flite != nullptr && flite->Init())
-            return flite;
+        ITtsBackend *synth = LoadSynthBackend();
+        if (synth != nullptr && synth->Init())
+            return synth;
     }
     return nullptr;
 }
@@ -171,6 +211,16 @@ ITtsBackend *ActiveBackend() {
         g_backend = SelectBackend();
     return g_backend;
 }
+
+// Subscribed to the engine's per-frame WorldTick (installed in DllMain). Lets
+// the active backend deliver off-thread playback events on the main thread.
+// Reads g_backend directly (not ActiveBackend) so an unused TTS system never
+// forces backend selection from the tick.
+void PumpBackend() {
+    if (g_backend != nullptr)
+        g_backend->Pump();
+}
+const Tick::WorldTick::AutoSubscribe _tickSub{&PumpBackend};
 
 // ---------------------------------------------------------------------------
 // UTF-8 / wide conversion
@@ -437,7 +487,7 @@ int __fastcall OnVoiceChanged(CVar::Factory::Handle c, const char *p, const char
     const int maxIdx = VoiceCount() - 1;
     return ClampRange(c, p, n, 0, maxIdx < 0 ? 0 : maxIdx);
 }
-// ttsEngine accepts only "auto" / "sapi" / "flite". Anything else is clamped
+// ttsEngine accepts only "auto" / "sapi" / "espeak". Anything else is clamped
 // to "auto" (re-entrant SetString, reject the bad input). On a valid change
 // we drop the cached backend so the next use re-selects, and refresh the
 // voice list (the active backend's voices differ).
@@ -445,7 +495,7 @@ int __fastcall OnEngineChanged(CVar::Factory::Handle c, const char *, const char
     if (next == nullptr)
         return 1;
     if (std::strcmp(next, "auto") == 0 || std::strcmp(next, "sapi") == 0 ||
-        std::strcmp(next, "flite") == 0) {
+        std::strcmp(next, "espeak") == 0) {
         g_backend = nullptr;
         RefreshVoices();
         return 1;

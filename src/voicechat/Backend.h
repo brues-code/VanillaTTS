@@ -50,6 +50,13 @@ struct ITtsBackend {
     // for purged utterances (matches Blizzard's StopSpeakingText).
     virtual void Stop() = 0;
 
+    // Called every frame on the main (game) thread (via the WorldTick hook).
+    // A backend that synthesizes off-thread (the software synth) drains its
+    // playback-completion queue here and invokes Playback:: callbacks where
+    // Lua is safe. SAPI marshals via the message pump, so its Pump is a
+    // no-op — hence the non-pure default.
+    virtual void Pump() {}
+
     virtual ~ITtsBackend() {}
 };
 

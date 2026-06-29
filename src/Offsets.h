@@ -28,6 +28,11 @@ enum Offsets {
     // Master in-world Lua function registrar. `void __fastcall()`. After the
     // original runs we fire `Game::RunModuleRegistrations()`.
     FUN_LOAD_SCRIPT_FUNCTIONS = 0x490250,
+    // Engine world-subsystem update — the canonical once-per-frame hook
+    // target (single caller, quiet region, no known Octo-DLL collisions).
+    // `void __fastcall(int, int, int)`. Used to drain the software synth's
+    // playback-completion queue on the main thread (Lua isn't thread-safe).
+    FUN_WORLD_TICK = 0x0066FD50,
 
     // ---- Lua function registration ----------------------------------------
     // Registers a single global Lua function. `__fastcall(name, func)`.

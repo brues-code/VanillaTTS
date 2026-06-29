@@ -16,6 +16,7 @@
 #include "MinHook.h"
 #include "Offsets.h"
 #include "event/Custom.h"
+#include "tick/WorldTick.h"
 
 #include <windows.h>
 
@@ -83,6 +84,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
                       LoadScriptFunctions_o);
         HOOK_FUNCTION(Offsets::FUN_FRAME_REGISTER_EVENT, FrameRegisterEvent_h,
                       FrameRegisterEvent_o);
+
+        // Per-frame tick — drains the software synth's playback-completion
+        // queue on the main thread (see Tick::WorldTick / Tts::PumpBackend).
+        if (!Tick::WorldTick::InstallHook())
+            return FALSE;
     } else if (reason == DLL_PROCESS_DETACH) {
         MH_Uninitialize();
     }
