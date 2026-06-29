@@ -11,14 +11,17 @@
 // You should have received a copy of the GNU General Public License along with
 // VanillaTTS. If not, see <https://www.gnu.org/licenses/>.
 
-// Text-to-speech — a Windows SAPI backend behind modern WoW's C_VoiceChat /
-// C_TTSSettings Lua surface. Ported from awesome_wotlk's VoiceChat.cpp (the
-// 3.3.5 implementation); the SAPI core is client-version-agnostic, so only
-// the three integration seams are project-native:
+// Text-to-speech — modern WoW's C_VoiceChat / C_TTSSettings Lua surface,
+// backed by a pluggable speech engine (ITtsBackend). The module owns the
+// API-facing concerns; the backend owns the actual synthesis/playback:
+//   - SAPI on native Windows (SapiBackend)
+//   - Flite software synth under Wine (loaded lazily as VanillaTTS_synth.dll)
+//
+// The integration seams stay project-native:
 //   - namespaces  → Game::Lua::RegisterTableFunction
 //   - events      → Event::Custom (AutoReserve + Fire)
-//   - settings    → CVar::Factory (ttsVoice / ttsSpeed / ttsVolume, persisted
-//                   to Config.wtf, clamped via change callbacks)
+//   - settings    → CVar::Factory (ttsVoice / ttsSpeed / ttsVolume / ttsEngine,
+//                   persisted to Config.wtf, clamped via change callbacks)
 //
 // Lua surface:
 //   C_VoiceChat
@@ -37,24 +40,20 @@
 // Events: VOICE_CHAT_TTS_PLAYBACK_STARTED/FINISHED/FAILED,
 //         VOICE_CHAT_TTS_SPEAK_TEXT_UPDATE (reserved, unused),
 //         VOICE_CHAT_TTS_VOICES_UPDATE.
-//
-// Threading: SAPI is created on the main (game) thread under an STA, and
-// SetNotifyCallbackFunction marshals the notify back to that thread's message
-// pump (WoW pumps messages every frame), so OnSpeechNotify runs on the main
-// thread and may touch the Lua event dispatcher safely.
 
 #include "Game.h"
 #include "cvar/Factory.h"
 #include "event/Custom.h"
+#include "voicechat/Backend.h"
+#include "voicechat/SapiBackend.h"
 
-#include <initguid.h> // instantiate the SAPI GUIDs in this TU (no sapi.lib)
-#include <sapi.h>
-#include <windows.h>
+#include <windows.h> // WideCharToMultiByte / MultiByteToWideChar
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <cwctype>
 #include <mutex>
 #include <string>
@@ -86,13 +85,15 @@ const Event::Custom::AutoReserve _r5{kEvtVoicesUpdate};
 constexpr const char *kCVarVoice  = "ttsVoice";
 constexpr const char *kCVarSpeed  = "ttsSpeed";
 constexpr const char *kCVarVolume = "ttsVolume";
+constexpr const char *kCVarEngine = "ttsEngine"; // "auto" / "sapi" / "flite"
 
 CVar::Factory::Handle g_cvarVoice  = nullptr;
 CVar::Factory::Handle g_cvarSpeed  = nullptr;
 CVar::Factory::Handle g_cvarVolume = nullptr;
+CVar::Factory::Handle g_cvarEngine = nullptr;
 
-// Destination constants (kept for API parity; no special handling — SAPI
-// queues FIFO either way).
+// Destination constants (kept for API parity; no special handling — the
+// backends queue FIFO either way).
 enum : int {
     DEST_LOCAL_PLAYBACK        = 1,
     DEST_QUEUED_LOCAL_PLAYBACK = 4,
@@ -103,11 +104,10 @@ int ClampDestination(int d) {
 }
 
 // ---------------------------------------------------------------------------
-// SAPI state
+// Utterance lifecycle bookkeeping (backend-agnostic). The backend reports
+// progress by utteranceID via Playback::; we map that to the destination the
+// Lua caller requested and dedup the STARTED edge.
 // ---------------------------------------------------------------------------
-ISpVoice *g_pVoice = nullptr;
-bool g_comInit = false;
-
 int g_nextUtteranceID = 1;
 int NextUtteranceID() {
     if (g_nextUtteranceID >= 0x7fffffff)
@@ -116,18 +116,61 @@ int NextUtteranceID() {
 }
 
 struct UtteranceMeta {
-    int id;
     int destination;
     bool startedEmitted;
 };
-std::mutex g_streamMx;
-std::unordered_map<ULONG, UtteranceMeta> g_streamMap;
+std::mutex g_uttMx;
+std::unordered_map<uint32_t, UtteranceMeta> g_uttMap;
 
-struct VoiceEntry {
-    int voiceID;
-    std::wstring name;
-};
 std::vector<VoiceEntry> g_cachedVoices;
+
+// ---------------------------------------------------------------------------
+// Backend selection
+// ---------------------------------------------------------------------------
+SapiBackend g_sapi;
+ITtsBackend *g_backend = nullptr;
+
+// Pick a backend honoring the ttsEngine cvar. "auto" prefers SAPI and falls
+// through to Flite when SAPI is unavailable/voiceless (the Wine case);
+// "sapi"/"flite" force a specific engine, with a fallback so TTS still works
+// if the forced engine can't initialize. Flite lives in a lazily-loaded
+// VanillaTTS_synth.dll (Step 6) — not wired up yet, so the Flite branch is a
+// placeholder for now.
+ITtsBackend *FliteBackend() {
+    // TODO(Step 6): LoadLibrary("VanillaTTS_synth.dll") and adopt its backend.
+    return nullptr;
+}
+
+ITtsBackend *SelectBackend() {
+    const char *raw = CVar::Factory::GetString(g_cvarEngine);
+    const std::string mode = (raw != nullptr && *raw != '\0') ? raw : "auto";
+
+    if (mode == "sapi" || mode == "auto") {
+        if (g_sapi.Init())
+            return &g_sapi;
+    }
+    if (mode == "flite" || mode == "auto") {
+        ITtsBackend *flite = FliteBackend();
+        if (flite != nullptr && flite->Init())
+            return flite;
+    }
+    // Forced engine couldn't initialize — fall back so TTS still functions.
+    if (mode == "flite") {
+        if (g_sapi.Init())
+            return &g_sapi;
+    } else if (mode == "sapi") {
+        ITtsBackend *flite = FliteBackend();
+        if (flite != nullptr && flite->Init())
+            return flite;
+    }
+    return nullptr;
+}
+
+ITtsBackend *ActiveBackend() {
+    if (g_backend == nullptr)
+        g_backend = SelectBackend();
+    return g_backend;
+}
 
 // ---------------------------------------------------------------------------
 // UTF-8 / wide conversion
@@ -174,107 +217,19 @@ void FirePlaybackFailed(const char *status, int utteranceID, int dest) {
 }
 
 // ---------------------------------------------------------------------------
-// COM / SAPI lifecycle
+// Voices
 // ---------------------------------------------------------------------------
-void InitCom() {
-    if (g_comInit)
-        return;
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    // S_FALSE = already initialized on this thread; treat as success.
-    if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE)
-        g_comInit = true;
-}
-
-void __stdcall OnSpeechNotify(WPARAM, LPARAM) {
-    if (g_pVoice == nullptr)
-        return;
-    SPEVENT ev = {};
-    ULONG fetched = 0;
-    while (SUCCEEDED(g_pVoice->GetEvents(1, &ev, &fetched)) && fetched == 1) {
-        if (ev.eEventId == SPEI_START_INPUT_STREAM) {
-            std::lock_guard<std::mutex> lock(g_streamMx);
-            auto it = g_streamMap.find(ev.ulStreamNum);
-            if (it != g_streamMap.end() && !it->second.startedEmitted) {
-                FirePlaybackStarted(1, it->second.id, /*durationMS*/ 0,
-                                    it->second.destination);
-                it->second.startedEmitted = true;
-            }
-        } else if (ev.eEventId == SPEI_END_INPUT_STREAM) {
-            UtteranceMeta meta{0, DEST_LOCAL_PLAYBACK, false};
-            {
-                std::lock_guard<std::mutex> lock(g_streamMx);
-                auto it = g_streamMap.find(ev.ulStreamNum);
-                if (it != g_streamMap.end()) {
-                    meta = it->second;
-                    g_streamMap.erase(it);
-                }
-            }
-            FirePlaybackFinished(1, meta.id, meta.destination);
-        }
-        // Only START/END stream events are requested; neither carries an
-        // allocated lParam, so no SpClearEvent (sphelper) is needed.
-        ev = SPEVENT{};
-    }
-}
-
-void InitVoice() {
-    if (g_pVoice != nullptr)
-        return;
-    InitCom();
-    HRESULT hr = CoCreateInstance(CLSID_SpVoice, nullptr, CLSCTX_ALL,
-                                  IID_ISpVoice, reinterpret_cast<void **>(&g_pVoice));
-    if (FAILED(hr) || g_pVoice == nullptr) {
-        g_pVoice = nullptr;
-        return;
-    }
-    g_pVoice->SetNotifyCallbackFunction(&OnSpeechNotify, 0, 0);
-    const ULONGLONG interest =
-        SPFEI(SPEI_START_INPUT_STREAM) | SPFEI(SPEI_END_INPUT_STREAM);
-    g_pVoice->SetInterest(interest, interest);
-}
-
-// ---------------------------------------------------------------------------
-// Voice enumeration (CLSID_SpObjectTokenCategory; no sphelper)
-// ---------------------------------------------------------------------------
-std::vector<VoiceEntry> EnumerateVoices() {
-    InitCom();
-    std::vector<VoiceEntry> voices;
-
-    ISpObjectTokenCategory *cat = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_SpObjectTokenCategory, nullptr, CLSCTX_ALL,
-                                IID_ISpObjectTokenCategory,
-                                reinterpret_cast<void **>(&cat))) ||
-        cat == nullptr)
-        return voices;
-
-    if (SUCCEEDED(cat->SetId(SPCAT_VOICES, FALSE))) {
-        IEnumSpObjectTokens *en = nullptr;
-        if (SUCCEEDED(cat->EnumTokens(nullptr, nullptr, &en)) && en != nullptr) {
-            ISpObjectToken *tok = nullptr;
-            ULONG fetched = 0;
-            int index = 0;
-            while (en->Next(1, &tok, &fetched) == S_OK && fetched == 1) {
-                LPWSTR desc = nullptr;
-                if (SUCCEEDED(tok->GetStringValue(nullptr, &desc)) && desc != nullptr) {
-                    voices.push_back({index, desc});
-                    CoTaskMemFree(desc);
-                }
-                tok->Release();
-                ++index;
-            }
-            en->Release();
-        }
-    }
-    cat->Release();
-    return voices;
+std::vector<VoiceEntry> BackendVoices() {
+    ITtsBackend *b = ActiveBackend();
+    return b != nullptr ? b->Voices() : std::vector<VoiceEntry>{};
 }
 
 int VoiceCount() {
-    return static_cast<int>(EnumerateVoices().size());
+    return static_cast<int>(BackendVoices().size());
 }
 
 void RefreshVoices() {
-    auto fresh = EnumerateVoices();
+    auto fresh = BackendVoices();
     bool changed = fresh.size() != g_cachedVoices.size();
     if (!changed) {
         for (size_t i = 0; i < fresh.size(); ++i) {
@@ -289,75 +244,37 @@ void RefreshVoices() {
         FireVoicesUpdate();
 }
 
-// Select the voice at enumeration index `voiceID` on g_pVoice.
-bool SelectVoice(int voiceID) {
-    ISpObjectTokenCategory *cat = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_SpObjectTokenCategory, nullptr, CLSCTX_ALL,
-                                IID_ISpObjectTokenCategory,
-                                reinterpret_cast<void **>(&cat))) ||
-        cat == nullptr)
-        return false;
-
-    bool set = false;
-    if (SUCCEEDED(cat->SetId(SPCAT_VOICES, FALSE))) {
-        IEnumSpObjectTokens *en = nullptr;
-        if (SUCCEEDED(cat->EnumTokens(nullptr, nullptr, &en)) && en != nullptr) {
-            ISpObjectToken *tok = nullptr;
-            ULONG fetched = 0;
-            int index = 0;
-            while (en->Next(1, &tok, &fetched) == S_OK && fetched == 1) {
-                if (index == voiceID) {
-                    set = SUCCEEDED(g_pVoice->SetVoice(tok));
-                    tok->Release();
-                    break;
-                }
-                tok->Release();
-                ++index;
-            }
-            en->Release();
-        }
-    }
-    cat->Release();
-    return set;
-}
-
 // ---------------------------------------------------------------------------
-// Speak / stop
+// Speak / stop (route through the active backend)
 // ---------------------------------------------------------------------------
 void SpeakText(int voiceID, const std::wstring &text, int destination, int rate,
                int volume) {
-    const int utteranceID = NextUtteranceID();
+    const uint32_t utteranceID = static_cast<uint32_t>(NextUtteranceID());
     const int dest = ClampDestination(destination);
 
-    InitVoice();
-    if (g_pVoice == nullptr) {
-        FirePlaybackFailed("EngineAllocationFailed", utteranceID, dest);
-        return;
-    }
-    if (!SelectVoice(voiceID)) {
-        FirePlaybackFailed("InternalError", utteranceID, dest);
-        return;
+    {
+        std::lock_guard<std::mutex> lock(g_uttMx);
+        g_uttMap[utteranceID] = UtteranceMeta{dest, false};
     }
 
-    g_pVoice->SetRate(std::clamp(rate, -10, 10));
-    g_pVoice->SetVolume(static_cast<USHORT>(std::clamp(volume, 0, 100)));
-
-    ULONG streamNum = 0;
-    if (FAILED(g_pVoice->Speak(text.c_str(), SPF_ASYNC, &streamNum))) {
-        FirePlaybackFailed("InternalError", utteranceID, dest);
+    ITtsBackend *b = ActiveBackend();
+    if (b == nullptr) {
+        // No engine available — fire FAILED ourselves (no backend to do it).
+        Playback::Failed(utteranceID, "EngineAllocationFailed");
         return;
     }
-    std::lock_guard<std::mutex> lock(g_streamMx);
-    g_streamMap[streamNum] = UtteranceMeta{utteranceID, dest, false};
+    // On failure the backend fires Playback::Failed itself (which clears the
+    // utterance), so there's nothing more to do here.
+    b->Speak(voiceID, text, rate, volume, utteranceID);
 }
 
 void StopAll() {
-    InitVoice();
-    if (g_pVoice == nullptr)
-        return;
-    g_pVoice->Speak(nullptr, SPF_PURGEBEFORESPEAK, nullptr);
-    std::lock_guard<std::mutex> lock(g_streamMx);
-    g_streamMap.clear();
+    ITtsBackend *b = ActiveBackend();
+    if (b != nullptr)
+        b->Stop();
+    // No PLAYBACK_FINISHED for purged utterances (matches StopSpeakingText).
+    std::lock_guard<std::mutex> lock(g_uttMx);
+    g_uttMap.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -435,7 +352,7 @@ int __fastcall Script_GetSpeechVoiceID(void *L) {
 }
 int __fastcall Script_GetVoiceOptionName(void *L) {
     const int id = CVar::Factory::GetInt(g_cvarVoice, 0);
-    auto voices = EnumerateVoices();
+    auto voices = BackendVoices();
     if (id >= 0 && id < static_cast<int>(voices.size()))
         Game::Lua::PushString(L, WideToUtf8(voices[id].name).c_str());
     else
@@ -462,7 +379,7 @@ int __fastcall Script_SetVoiceOptionByName(void *L) {
     if (!Game::Lua::IsString(L, 1))
         return 0;
     const std::wstring want = Utf8ToWide(Game::Lua::ToString(L, 1));
-    auto voices = EnumerateVoices();
+    auto voices = BackendVoices();
     for (const auto &v : voices) {
         if (v.name.size() == want.size()) {
             bool eq = true;
@@ -520,11 +437,30 @@ int __fastcall OnVoiceChanged(CVar::Factory::Handle c, const char *p, const char
     const int maxIdx = VoiceCount() - 1;
     return ClampRange(c, p, n, 0, maxIdx < 0 ? 0 : maxIdx);
 }
+// ttsEngine accepts only "auto" / "sapi" / "flite". Anything else is clamped
+// to "auto" (re-entrant SetString, reject the bad input). On a valid change
+// we drop the cached backend so the next use re-selects, and refresh the
+// voice list (the active backend's voices differ).
+int __fastcall OnEngineChanged(CVar::Factory::Handle c, const char *, const char *next, void *) {
+    if (next == nullptr)
+        return 1;
+    if (std::strcmp(next, "auto") == 0 || std::strcmp(next, "sapi") == 0 ||
+        std::strcmp(next, "flite") == 0) {
+        g_backend = nullptr;
+        RefreshVoices();
+        return 1;
+    }
+    CVar::Factory::SetString(c, "auto");
+    return 0;
+}
 
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 void RegisterLuaFunctions() {
+    // Engine first: the other cvars' callbacks consult it during their own
+    // registration-time fire to pick the active backend for clamping.
+    g_cvarEngine = CVar::Factory::Register(kCVarEngine, "auto", 0, &OnEngineChanged);
     g_cvarVoice  = CVar::Factory::Register(kCVarVoice,  "0",   0, &OnVoiceChanged);
     g_cvarSpeed  = CVar::Factory::Register(kCVarSpeed,  "0",   0, &OnSpeedChanged);
     g_cvarVolume = CVar::Factory::Register(kCVarVolume, "100", 0, &OnVolumeChanged);
@@ -549,5 +485,57 @@ void RegisterLuaFunctions() {
 const Game::ModuleAutoRegister _autoreg{&RegisterLuaFunctions};
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Playback lifecycle — called by the active backend (on the main thread) to
+// drive the Lua event surface. Defined out of the anonymous namespace because
+// they're declared in Backend.h with external linkage; they still reach the
+// file-scope helpers/state above since this is the same TU.
+// ---------------------------------------------------------------------------
+namespace Playback {
+
+void Started(uint32_t utteranceID) {
+    int dest = DEST_LOCAL_PLAYBACK;
+    bool fire = false;
+    {
+        std::lock_guard<std::mutex> lock(g_uttMx);
+        auto it = g_uttMap.find(utteranceID);
+        if (it != g_uttMap.end() && !it->second.startedEmitted) {
+            dest = it->second.destination;
+            it->second.startedEmitted = true;
+            fire = true;
+        }
+    }
+    if (fire)
+        FirePlaybackStarted(1, static_cast<int>(utteranceID), /*durationMS*/ 0, dest);
+}
+
+void Finished(uint32_t utteranceID) {
+    int dest = DEST_LOCAL_PLAYBACK;
+    {
+        std::lock_guard<std::mutex> lock(g_uttMx);
+        auto it = g_uttMap.find(utteranceID);
+        if (it != g_uttMap.end()) {
+            dest = it->second.destination;
+            g_uttMap.erase(it);
+        }
+    }
+    FirePlaybackFinished(1, static_cast<int>(utteranceID), dest);
+}
+
+void Failed(uint32_t utteranceID, const char *status) {
+    int dest = DEST_LOCAL_PLAYBACK;
+    {
+        std::lock_guard<std::mutex> lock(g_uttMx);
+        auto it = g_uttMap.find(utteranceID);
+        if (it != g_uttMap.end()) {
+            dest = it->second.destination;
+            g_uttMap.erase(it);
+        }
+    }
+    FirePlaybackFailed(status, static_cast<int>(utteranceID), dest);
+}
+
+} // namespace Playback
 
 } // namespace VoiceChat::Tts
