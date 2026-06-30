@@ -57,7 +57,8 @@ private:
     };
 
     void WorkerLoop();
-    // Produce 16 kHz mono 16-bit PCM for `job`. (5a: placeholder tone.)
+    // Synthesize mono 16-bit PCM (at m_sampleRate) for `job` via espeak-ng.
+    // Runs only on the worker thread (espeak is not reentrant).
     std::vector<int16_t> Synthesize(const Job &job);
     // Blocking playback of one PCM buffer; returns false on open/write error.
     // A concurrent Stop() (waveOutReset) ends the wait early and is detected
@@ -69,6 +70,12 @@ private:
 
     SynthHost m_host;
     bool m_inited = false;
+    int m_sampleRate = 22050; // set from espeak_Initialize
+
+    // Voice list cached once in Init() (on the main thread) so Voices() and
+    // Speak() never call espeak concurrently with the worker's synthesis.
+    std::vector<VoiceEntry> m_cachedVoices;
+    std::vector<std::string> m_voiceIds; // espeak identifier per voiceID
 
     std::thread m_worker;
     std::mutex m_jobMx;

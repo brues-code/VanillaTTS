@@ -13,15 +13,66 @@
 
 #include "SynthBackend.h"
 
+#include <espeak-ng/speak_lib.h>
 #include <windows.h>
 
 #include <algorithm>
-#include <cmath>
+#include <cstring>
+#include <string>
 
 namespace VoiceChat::Tts {
 
 namespace {
-constexpr int kSampleRate = 16000; // Hz, mono, 16-bit — matches espeak-ng output
+
+// espeak's synth callback is a context-free C function. Synthesis is
+// serialized on the single worker thread, so a file-scope pointer to the
+// current job's PCM buffer is sufficient (no concurrency).
+std::vector<int16_t> *g_accum = nullptr;
+
+int SynthCallback(short *wav, int numsamples, espeak_EVENT *) {
+    if (g_accum != nullptr && wav != nullptr && numsamples > 0)
+        g_accum->insert(g_accum->end(), wav, wav + numsamples);
+    return 0; // continue synthesis
+}
+
+std::string WideToUtf8(const std::wstring &w) {
+    if (w.empty())
+        return {};
+    int need = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (need <= 1)
+        return {};
+    std::string out(static_cast<size_t>(need - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), -1, &out[0], need - 1, nullptr, nullptr);
+    return out;
+}
+
+std::wstring Utf8ToWide(const char *s) {
+    if (s == nullptr || *s == '\0')
+        return {};
+    int need = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+    if (need <= 1)
+        return {};
+    std::wstring out(static_cast<size_t>(need - 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s, -1, &out[0], need);
+    return out;
+}
+
+// Directory containing this DLL (and, beside it, espeak-ng-data/).
+std::string ModuleDir() {
+    char path[MAX_PATH] = {};
+    HMODULE self = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(&ModuleDir), &self) &&
+        GetModuleFileNameA(self, path, MAX_PATH) > 0) {
+        char *slash = std::strrchr(path, '\\');
+        if (slash != nullptr)
+            slash[1] = '\0';
+        return path;
+    }
+    return {};
+}
+
 } // namespace
 
 SynthBackend::SynthBackend(const SynthHost &host) : m_host(host) {}
@@ -43,15 +94,40 @@ SynthBackend::~SynthBackend() {
 bool SynthBackend::Init() {
     if (m_inited)
         return true;
-    // (5b: espeak_Initialize here; return false if it fails.)
+
+    // espeak-ng-data ships beside this DLL; pass our own directory as the
+    // path espeak searches for it. DONT_EXIT so a data/init failure never
+    // calls exit() and takes down WoW.
+    const std::string dir = ModuleDir();
+    const int rate = espeak_Initialize(AUDIO_OUTPUT_SYNCHRONOUS, /*buflength*/ 0,
+                                       dir.empty() ? nullptr : dir.c_str(),
+                                       espeakINITIALIZE_DONT_EXIT);
+    if (rate <= 0)
+        return false; // engine unavailable → selector falls back
+    m_sampleRate = rate;
+    espeak_SetSynthCallback(&SynthCallback);
+
+    // Enumerate voices once, here on the main thread, and cache them — so
+    // Voices()/Speak() never touch espeak concurrently with the worker.
+    m_cachedVoices.clear();
+    m_voiceIds.clear();
+    if (const espeak_VOICE **list = espeak_ListVoices(nullptr)) {
+        for (int i = 0; list[i] != nullptr; ++i) {
+            const espeak_VOICE *v = list[i];
+            const char *name = (v->name != nullptr) ? v->name : "";
+            const char *id = (v->identifier != nullptr) ? v->identifier : name;
+            m_cachedVoices.push_back(VoiceEntry{i, Utf8ToWide(name)});
+            m_voiceIds.emplace_back(id);
+        }
+    }
+
     m_worker = std::thread(&SynthBackend::WorkerLoop, this);
     m_inited = true;
     return true;
 }
 
 std::vector<VoiceEntry> SynthBackend::Voices() {
-    // (5b: enumerate espeak-ng voices.)
-    return {VoiceEntry{0, L"VanillaTTS Software (stub)"}};
+    return m_cachedVoices; // cached in Init; no espeak call (avoids races)
 }
 
 bool SynthBackend::Speak(int voiceID, const std::wstring &text, int rate,
@@ -74,6 +150,9 @@ void SynthBackend::Stop() {
         m_jobs.clear();
         m_generation.fetch_add(1);
     }
+    // Don't espeak_Cancel here — espeak is not thread-safe and the worker may
+    // be mid-Synth. The generation bump makes the worker discard the in-flight
+    // result; waveOutReset aborts any audio already playing.
     if (auto *h = static_cast<HWAVEOUT>(m_activeWaveOut.load()))
         waveOutReset(h);
 }
@@ -137,31 +216,33 @@ void SynthBackend::WorkerLoop() {
     }
 }
 
-// Placeholder synthesis: a 220 Hz sine whose length tracks the text, scaled
-// by volume. Proves the PCM→waveOut path end to end; replaced by espeak-ng
-// in Step 5b.
 std::vector<int16_t> SynthBackend::Synthesize(const Job &job) {
-    const size_t chars = job.text.size();
-    // ~60 ms per character, clamped to [0.2 s, 3 s].
-    double seconds = static_cast<double>(chars) * 0.06;
-    seconds = std::clamp(seconds, 0.2, 3.0);
-    const size_t samples = static_cast<size_t>(seconds * kSampleRate);
+    if (job.voiceID >= 0 && job.voiceID < static_cast<int>(m_voiceIds.size()))
+        espeak_SetVoiceByName(m_voiceIds[job.voiceID].c_str());
 
-    const double amp = std::clamp(job.volume, 0, 100) / 100.0 * 8000.0;
-    const double freq = 220.0;
-    std::vector<int16_t> pcm(samples);
-    for (size_t i = 0; i < samples; ++i) {
-        const double t = static_cast<double>(i) / kSampleRate;
-        pcm[i] = static_cast<int16_t>(amp * std::sin(2.0 * 3.14159265358979323846 * freq * t));
-    }
-    return pcm;
+    // Map our API ranges to espeak's. rate: SAPI-style -10..10 (0 = normal)
+    // → words/min around espeakRATE_NORMAL; volume: 0..100 → espeak 0..200.
+    espeak_SetParameter(espeakRATE,
+                        std::clamp(espeakRATE_NORMAL + job.rate * 20,
+                                   espeakRATE_MINIMUM, espeakRATE_MAXIMUM),
+                        0);
+    espeak_SetParameter(espeakVOLUME, std::clamp(job.volume, 0, 200), 0);
+
+    const std::string utf8 = WideToUtf8(job.text);
+    std::vector<int16_t> out;
+    g_accum = &out;
+    espeak_Synth(utf8.c_str(), utf8.size() + 1, /*position*/ 0, POS_CHARACTER,
+                 /*end_position*/ 0, espeakCHARS_UTF8, nullptr, nullptr);
+    espeak_Synchronize();
+    g_accum = nullptr;
+    return out;
 }
 
 bool SynthBackend::PlayPcm(const std::vector<int16_t> &pcm) {
     WAVEFORMATEX wfx = {};
     wfx.wFormatTag = WAVE_FORMAT_PCM;
     wfx.nChannels = 1;
-    wfx.nSamplesPerSec = kSampleRate;
+    wfx.nSamplesPerSec = static_cast<DWORD>(m_sampleRate);
     wfx.wBitsPerSample = 16;
     wfx.nBlockAlign = static_cast<WORD>(wfx.nChannels * wfx.wBitsPerSample / 8);
     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
@@ -185,7 +266,7 @@ bool SynthBackend::PlayPcm(const std::vector<int16_t> &pcm) {
     bool ok = false;
     if (waveOutPrepareHeader(hwo, &hdr, sizeof hdr) == MMSYSERR_NOERROR) {
         if (waveOutWrite(hwo, &hdr, sizeof hdr) == MMSYSERR_NOERROR) {
-            // CALLBACK_EVENT signals on each buffer completion (and Stop's
+            // CALLBACK_EVENT signals on buffer completion (and Stop's
             // waveOutReset). Wait until the buffer is flagged done.
             while ((hdr.dwFlags & WHDR_DONE) == 0)
                 WaitForSingleObject(done, INFINITE);
