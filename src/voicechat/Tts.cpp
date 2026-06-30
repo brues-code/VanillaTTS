@@ -181,10 +181,12 @@ ITtsBackend *LoadSynthBackend() {
 // through to the software synth when SAPI is unavailable/voiceless (the Wine
 // case); "sapi"/"espeak" force a specific engine, with a fallback so TTS
 // still works if the forced engine can't initialize.
-ITtsBackend *SelectBackend() {
-    const char *raw = CVar::Factory::GetString(g_cvarEngine);
-    const std::string mode = (raw != nullptr && *raw != '\0') ? raw : "auto";
-
+// Select a backend for an explicit engine mode. Taking the mode as a
+// parameter (rather than always reading the cvar) is load-bearing for the
+// change callback: when ttsEngine's callback fires, the engine has NOT yet
+// stored the new value, so reading the cvar there would see the OLD engine.
+// The callback passes the incoming value in directly.
+ITtsBackend *SelectBackendFor(const std::string &mode) {
     if (mode == "sapi" || mode == "auto") {
         if (g_sapi.Init())
             return &g_sapi;
@@ -204,6 +206,11 @@ ITtsBackend *SelectBackend() {
             return synth;
     }
     return nullptr;
+}
+
+ITtsBackend *SelectBackend() {
+    const char *raw = CVar::Factory::GetString(g_cvarEngine);
+    return SelectBackendFor((raw != nullptr && *raw != '\0') ? raw : "auto");
 }
 
 ITtsBackend *ActiveBackend() {
@@ -496,7 +503,10 @@ int __fastcall OnEngineChanged(CVar::Factory::Handle c, const char *, const char
         return 1;
     if (std::strcmp(next, "auto") == 0 || std::strcmp(next, "sapi") == 0 ||
         std::strcmp(next, "espeak") == 0) {
-        g_backend = nullptr;
+        // Select from the incoming value — the cvar still holds the OLD value
+        // until this callback accepts the change, so SelectBackend() (which
+        // reads the cvar) would pick the wrong engine.
+        g_backend = SelectBackendFor(next);
         RefreshVoices();
         return 1;
     }
