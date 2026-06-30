@@ -81,15 +81,25 @@ Outputs `build\Release\VanillaTTS.dll` and `build\Release\VanillaTTS_synth.dll`.
 
 ## Installing
 
+**Required** — the core (SAPI on Windows):
+
 1. Drop `VanillaTTS.dll` where VanillaFixes loads DLLs and add it to `dlls.txt`.
+   This alone gives full TTS via Windows SAPI.
+
+**Optional** — only for the espeak-ng software-synth path (Wine, or a forced
+`ttsEngine=espeak`):
+
 2. Put `VanillaTTS_synth.dll` **beside** `VanillaTTS.dll` (the core resolves it
-   from its own directory). Do **not** add it to `dlls.txt` — it is loaded
-   on demand, not injected.
+   from its own directory). Do **not** add it to `dlls.txt` — it is loaded on
+   demand, not injected.
 3. Put the English-only `espeak-ng-data\` (produced by
    `scripts\trim-espeak-data.ps1`, ~1 MB) beside `VanillaTTS_synth.dll`.
 
-Only the espeak path loads the synth DLL + data; pure-SAPI (Windows) users
-never touch them.
+`VanillaTTS.dll` has **no load-time dependency** on the synth DLL — it loads and
+runs fine without it. If the synth DLL is absent, backend selection falls back
+to SAPI (and `auto` never loads it on a healthy SAPI system). So pure-SAPI
+(Windows) users can ship **just `VanillaTTS.dll`**; the synth DLL and
+`espeak-ng-data` are an add-on for the Wine/software-synth path.
 
 ## License
 
