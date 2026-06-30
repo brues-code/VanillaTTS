@@ -1,0 +1,74 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # espeak-ng is built standalone (not via add_subdirectory) — its
+      # CTest/CPack/all-language-data machinery otherwise hijacks the build
+      # tree as the top-level project. 32-bit static, /MT, no tests.
+      - name: Configure espeak-ng (32-bit static)
+        run: cmake -S external/espeak-ng -B external/espeak-ng/build -A Win32 -DBUILD_SHARED_LIBS=OFF -DENABLE_TESTS=OFF -DBUILD_TESTING=OFF -DUSE_ASYNC=OFF -DUSE_MBROLA=OFF -DUSE_LIBPCAUDIO=OFF -DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+
+      - name: Build espeak-ng
+        run: cmake --build external/espeak-ng/build --config Release
+
+      - name: Configure VanillaTTS (32-bit)
+        run: cmake -B build -A Win32
+
+      - name: Build VanillaTTS
+        run: cmake --build build --config Release
+
+      - name: Verify DLLs are 32-bit (x86)
+        run: |
+          foreach ($f in 'build/Release/VanillaTTS.dll','build/Release/VanillaTTS_synth.dll') {
+            $b = [IO.File]::ReadAllBytes($f)
+            $pe = [BitConverter]::ToInt32($b, 0x3C)
+            $machine = [BitConverter]::ToUInt16($b, $pe + 4)
+            if ($machine -ne 0x14C) { throw "$f is not x86 (machine=0x{0:X4})" -f $machine }
+            Write-Output ("{0}: x86 OK ({1:N0} bytes)" -f $f, (Get-Item $f).Length)
+          }
+
+      # Assemble the shippable layout: both DLLs + the English-only data dir.
+      - name: Assemble release payload
+        run: |
+          New-Item -ItemType Directory dist -Force | Out-Null
+          Copy-Item build/Release/VanillaTTS.dll dist/
+          Copy-Item build/Release/VanillaTTS_synth.dll dist/
+          Copy-Item README.md dist/
+          ./scripts/trim-espeak-data.ps1 -Dest dist/espeak-ng-data
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VanillaTTS
+          path: dist/**
+
+      # On a version tag (vX.Y.Z), zip the payload and publish a release.
+      - name: Package archive (tag only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: Compress-Archive -Path dist/* -DestinationPath "VanillaTTS-${{ github.ref_name }}.zip"
+
+      - name: Create GitHub Release (tag only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: VanillaTTS-${{ github.ref_name }}.zip
+          generate_release_notes: true
