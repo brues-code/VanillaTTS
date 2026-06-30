@@ -530,6 +530,15 @@ void RegisterLuaFunctions() {
     Game::Lua::RegisterTableFunction("C_TTSSettings", "SetVoiceOption", &Script_SetVoiceOption);
     Game::Lua::RegisterTableFunction("C_TTSSettings", "SetVoiceOptionByName", &Script_SetVoiceOptionByName);
     Game::Lua::RegisterTableFunction("C_TTSSettings", "RefreshVoices", &Script_RefreshVoices);
+
+    // The cvar change-callbacks above fire synchronously DURING their Register
+    // calls — at which point g_cvarEngine isn't assigned yet, so any backend
+    // selected then was chosen from a half-initialized state (a null engine
+    // handle reads as "auto" → SAPI). Discard that stale selection and pick
+    // once now, with all handles assigned and the persisted ttsEngine value
+    // in place, so a saved "espeak" actually takes effect at boot.
+    g_backend = nullptr;
+    RefreshVoices();
 }
 
 const Game::ModuleAutoRegister _autoreg{&RegisterLuaFunctions};
