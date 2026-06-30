@@ -81,6 +81,11 @@ Outputs `build\Release\VanillaTTS.dll` and `build\Release\VanillaTTS_synth.dll`.
 
 ## Installing
 
+Releases provide two archives: **`VanillaTTS-<ver>.zip`** (core only — SAPI on
+Windows) and **`VanillaTTS-espeak-<ver>.zip`** (core + the optional espeak
+software-synth add-on for Wine). Grab whichever fits; the steps below describe
+the full layout.
+
 **Required** — the core (SAPI on Windows):
 
 1. Drop `VanillaTTS.dll` where VanillaFixes loads DLLs and add it to `dlls.txt`.

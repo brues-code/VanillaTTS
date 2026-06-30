@@ -46,29 +46,39 @@ jobs:
             Write-Output ("{0}: x86 OK ({1:N0} bytes)" -f $f, (Get-Item $f).Length)
           }
 
-      # Assemble the shippable layout: both DLLs + the English-only data dir.
-      - name: Assemble release payload
+      # Two shippable layouts: a tiny core (SAPI/Windows) and the full bundle
+      # with the optional espeak software-synth add-on (Wine).
+      - name: Assemble release payloads
         run: |
-          New-Item -ItemType Directory dist -Force | Out-Null
-          Copy-Item build/Release/VanillaTTS.dll dist/
-          Copy-Item build/Release/VanillaTTS_synth.dll dist/
-          Copy-Item README.md dist/
-          ./scripts/trim-espeak-data.ps1 -Dest dist/espeak-ng-data
+          # Core — SAPI on Windows; just the core DLL.
+          New-Item -ItemType Directory dist/core -Force | Out-Null
+          Copy-Item build/Release/VanillaTTS.dll dist/core/
+          Copy-Item README.md dist/core/
+          # espeak — core + synth DLL + English-only data (Wine/software synth).
+          New-Item -ItemType Directory dist/espeak -Force | Out-Null
+          Copy-Item build/Release/VanillaTTS.dll dist/espeak/
+          Copy-Item build/Release/VanillaTTS_synth.dll dist/espeak/
+          Copy-Item README.md dist/espeak/
+          ./scripts/trim-espeak-data.ps1 -Dest dist/espeak/espeak-ng-data
 
-      - name: Upload build artifact
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: VanillaTTS
           path: dist/**
 
-      # On a version tag (vX.Y.Z), zip the payload and publish a release.
-      - name: Package archive (tag only)
+      # On a version tag (vX.Y.Z), zip each payload and publish both.
+      - name: Package archives (tag only)
         if: startsWith(github.ref, 'refs/tags/v')
-        run: Compress-Archive -Path dist/* -DestinationPath "VanillaTTS-${{ github.ref_name }}.zip"
+        run: |
+          Compress-Archive -Path dist/core/* -DestinationPath "VanillaTTS-${{ github.ref_name }}.zip"
+          Compress-Archive -Path dist/espeak/* -DestinationPath "VanillaTTS-espeak-${{ github.ref_name }}.zip"
 
       - name: Create GitHub Release (tag only)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: VanillaTTS-${{ github.ref_name }}.zip
+          files: |
+            VanillaTTS-${{ github.ref_name }}.zip
+            VanillaTTS-espeak-${{ github.ref_name }}.zip
           generate_release_notes: true
