@@ -8,6 +8,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# softprops/action-gh-release needs write access to publish the release and
+# upload the zip assets; the default GITHUB_TOKEN is read-only.
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
