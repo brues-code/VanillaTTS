@@ -1,7 +1,6 @@
 # VanillaTTS
 
-A standalone DLL injected into **World of Warcraft 1.12.1** (Turtle WoW / Octo
-client, loaded by VanillaFixes) that adds modern WoW's text-to-speech Lua API:
+A standalone DLL injected into **World of Warcraft 1.12.1** (loaded by VanillaFixes) that adds modern WoW's text-to-speech Lua API:
 `C_VoiceChat` + `C_TTSSettings`, the `VOICE_CHAT_TTS_*` events, and the
 `ttsVoice` / `ttsSpeed` / `ttsVolume` CVars.
 
