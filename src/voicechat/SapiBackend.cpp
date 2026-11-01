@@ -199,6 +199,17 @@ void SapiBackend::Stop() {
     if (m_voice == nullptr)
         return;
     m_voice->Speak(nullptr, SPF_PURGEBEFORESPEAK, nullptr);
+    // The purge still queues START/END for the streams it cut off, and SAPI
+    // numbers streams from 1 again after it, so left in the queue those
+    // events would land on the next utterance: Started/Finished for it
+    // before it plays, and nothing when it really plays. The purge is
+    // synchronous and has queued them all by the time it returns (probed:
+    // speak/stop/speak with and without a pump between), so discard them
+    // here. Purged utterances signal nothing, as in retail.
+    SPEVENT ev = {};
+    ULONG fetched = 0;
+    while (SUCCEEDED(m_voice->GetEvents(1, &ev, &fetched)) && fetched == 1)
+        ev = SPEVENT{};
     std::lock_guard<std::mutex> lock(m_streamMx);
     m_streamToUtterance.clear();
 }
